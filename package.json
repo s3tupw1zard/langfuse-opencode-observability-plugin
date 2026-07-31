@@ -1,7 +1,7 @@
 {
-  "name": "@langfuse/opencode-observability-plugin",
-  "version": "0.2.0",
-  "description": "OpenCode plugin that sends session telemetry to Langfuse.",
+  "name": "@s3tupw1zard/langfuse-opencode-observability-plugin",
+  "version": "0.1.0-dev.1",
+  "description": "OpenCode observability plugin for Langfuse with enhanced LiteLLM routing and model telemetry.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
@@ -11,22 +11,26 @@
     }
   },
   "type": "module",
-  "author": "Langfuse",
+  "author": "s3tupw1zard",
+  "contributors": [
+    "Langfuse contributors"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/langfuse/opencode-observability-plugin.git"
+    "url": "git+https://github.com/s3tupw1zard/langfuse-opencode-observability-plugin.git"
   },
   "bugs": {
-    "url": "https://github.com/langfuse/opencode-observability-plugin/issues"
+    "url": "https://github.com/s3tupw1zard/langfuse-opencode-observability-plugin/issues"
   },
-  "homepage": "https://github.com/langfuse/opencode-observability-plugin#readme",
+  "homepage": "https://github.com/s3tupw1zard/langfuse-opencode-observability-plugin#readme",
   "keywords": [
     "langfuse",
     "opencode",
     "plugin",
     "observability",
-    "opentelemetry"
+    "opentelemetry",
+    "s3tupw1zard"
   ],
   "files": [
     "dist",
@@ -34,14 +38,16 @@
     "LICENSE"
   ],
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "tag": "dev"
   },
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "prepublishOnly": "npm run test && npm run build"
   },
   "dependencies": {
     "@langfuse/otel": "^5.4.1",
