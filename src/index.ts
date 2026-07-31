@@ -84,6 +84,7 @@ const LangfuseCredentialsSchema = Schema.Struct({
   baseUrl: Schema.optional(Schema.NonEmptyString),
   environment: Schema.optional(Schema.NonEmptyString),
   userId: Schema.optional(Schema.NonEmptyString),
+  captureInput: Schema.optional(Schema.Boolean),
 });
 
 type LangfuseCredentials = typeof LangfuseCredentialsSchema.Type;
@@ -291,12 +292,17 @@ const main = Effect.gen(function* () {
 
     const userId = credentials.userId ?? process.env.LANGFUSE_USER_ID;
 
+    const captureInput =
+      credentials.captureInput ??
+      (process.env.LANGFUSE_CAPTURE_INPUT === "true" || undefined);
+
     return yield* createLangfuseClient({
       publicKey: credentials.publicKey,
       secretKey: credentials.secretKey,
       baseUrl,
       environment,
       userId,
+      captureInput,
     });
   }).pipe(
     Effect.tap((client) =>

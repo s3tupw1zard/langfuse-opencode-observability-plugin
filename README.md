@@ -2,6 +2,10 @@
 
 OpenCode plugin that sends OpenCode session telemetry to Langfuse. It traces user turns, assistant generations, tool calls, retries, reasoning output, compaction output, and failed generation steps.
 
+## Upstream
+
+Originally forked from [Langfuse OpenCode Observability Plugin](https://github.com/langfuse/opencode-observability-plugin/tree/a3b8507389475f96fa5396baf0cf889bc229cdc8#readme) v0.2.0.
+
 ## Quick Start
 
 Enable the plugin in your `opencode.json` or `opencode.jsonc`:
