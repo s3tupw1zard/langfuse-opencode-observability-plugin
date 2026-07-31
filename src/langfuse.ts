@@ -12,10 +12,31 @@ import { Context as EffectContext, Effect } from "effect";
 
 import { PLUGIN_VERSION } from "./version.js";
 
+const MAX_INPUT_LENGTH = 10_000;
+
+export const redactSecrets = (text: string): string =>
+  text
+    .replace(/(sk-[a-zA-Z0-9]{20,})/g, "[REDACTED]")
+    .replace(/(pk-[a-zA-Z0-9]{20,})/g, "[REDACTED]")
+    .replace(/(Bearer\s+[a-zA-Z0-9_\-.]+)/gi, "Bearer [REDACTED]")
+    .replace(
+      /(api[_-]?key["']?\s*[:=]\s*["']?)[a-zA-Z0-9_\-.]+/gi,
+      "$1[REDACTED]",
+    );
+
+export const truncateInput = (text: string): string =>
+  text.length > MAX_INPUT_LENGTH
+    ? `${text.slice(0, MAX_INPUT_LENGTH)}... [truncated]`
+    : text;
+
+export const formatModelName = (providerID: string, modelID: string): string =>
+  `${providerID}/${modelID}`;
+
 export class LangfuseClient {
   readonly baseUrl: string;
   readonly forceFlush: Effect.Effect<void, unknown>;
   readonly shutdown: Effect.Effect<void, unknown>;
+  readonly captureInput: boolean;
   private readonly traceState: LangfuseTraceState;
 
   constructor(input: {
@@ -23,11 +44,13 @@ export class LangfuseClient {
     traceState: LangfuseTraceState;
     forceFlush: Effect.Effect<void, unknown>;
     shutdown: Effect.Effect<void, unknown>;
+    captureInput?: boolean;
   }) {
     this.baseUrl = input.baseUrl;
     this.traceState = input.traceState;
     this.forceFlush = input.forceFlush;
     this.shutdown = input.shutdown;
+    this.captureInput = input.captureInput ?? false;
   }
 
   clearTraceState() {
@@ -40,6 +63,8 @@ export class LangfuseClient {
     this.traceState.generationParentSpans.clear();
     this.traceState.turnObservationsByMessageId.clear();
     this.traceState.latestTurnObservationsBySession.clear();
+    this.traceState.turnInputsByMessageId.clear();
+    this.traceState.subagentInfoByMessageId.clear();
   }
 
   endActiveToolObservations(sessionID?: string, error?: SessionErrorInfo) {
@@ -240,8 +265,10 @@ export class LangfuseClient {
     if (existingStep && !existingStep.model) {
       existingStep.span.setAttribute(
         "langfuse.observation.model.name",
-        input.model.id,
+        formatModelName(input.model.providerID, input.model.id),
       );
+      existingStep.span.setAttribute("gen_ai.system", input.model.providerID);
+      existingStep.span.setAttribute("gen_ai.request.model", input.model.id);
       existingStep.span.setAttribute(
         "langfuse.observation.metadata",
         JSON.stringify({
@@ -249,6 +276,7 @@ export class LangfuseClient {
           providerID: input.model.providerID,
           variant: input.model.variant,
           snapshot: input.snapshot,
+          stage: input.agent,
         }),
       );
       this.traceState.activeGenerationSteps.set(input.sessionID, {
@@ -273,12 +301,18 @@ export class LangfuseClient {
         attributes: {
           "langfuse.observation.type": "generation",
           "session.id": input.sessionID,
-          "langfuse.observation.model.name": input.model.id,
+          "langfuse.observation.model.name": formatModelName(
+            input.model.providerID,
+            input.model.id,
+          ),
+          "gen_ai.system": input.model.providerID,
+          "gen_ai.request.model": input.model.id,
           "langfuse.observation.metadata": JSON.stringify({
             agent: input.agent,
             providerID: input.model.providerID,
             variant: input.model.variant,
             snapshot: input.snapshot,
+            stage: input.agent,
           }),
         },
         startTime: new Date(input.started),
@@ -310,6 +344,19 @@ export class LangfuseClient {
     }
 
     this.traceState.abortedSessions.delete(input.sessionID);
+
+    const subtaskPart = input.parts.find((p) => p.type === "subtask");
+    const isSubagent = Boolean(subtaskPart);
+    const subagentName = subtaskPart?.agent;
+
+    if (input.messageID) {
+      this.traceState.tracedMessageIds.add(input.messageID);
+      if (isSubagent) {
+        this.traceState.subagentInfoByMessageId.set(input.messageID, {
+          agent: subagentName,
+        });
+      }
+    }
 
     const formattedInput = {
       role: "user" as const,
@@ -350,8 +397,29 @@ export class LangfuseClient {
       }),
     };
 
+    const serializedInput = JSON.stringify(formattedInput);
+
     if (input.messageID) {
-      this.traceState.tracedMessageIds.add(input.messageID);
+      if (this.captureInput) {
+        this.traceState.turnInputsByMessageId.set(
+          input.messageID,
+          truncateInput(redactSecrets(serializedInput)),
+        );
+      }
+
+      const subagentPrompt = subtaskPart?.prompt;
+      if (isSubagent && subagentPrompt && input.messageID) {
+        const subagentInput = {
+          role: "user" as const,
+          parts: [
+            { type: "subtask", prompt: subagentPrompt, agent: subagentName },
+          ],
+        };
+        this.traceState.turnInputsByMessageId.set(
+          `${input.messageID}:subagent`,
+          truncateInput(redactSecrets(JSON.stringify(subagentInput))),
+        );
+      }
     }
 
     const previousTurn = this.traceState.latestTurnObservationsBySession.get(
@@ -365,18 +433,33 @@ export class LangfuseClient {
 
     this.traceState.generationParentSpans.delete(input.sessionID);
 
+    const fullModelName = input.model
+      ? formatModelName(input.model.providerID, input.model.modelID)
+      : undefined;
+
+    const turnMetadata: Record<string, unknown> = {
+      messageID: input.messageID,
+      agent: input.agent,
+      providerID: input.model?.providerID,
+      modelID: input.model?.modelID,
+    };
+
+    if (fullModelName) {
+      turnMetadata.fullModelName = fullModelName;
+    }
+
+    if (isSubagent) {
+      turnMetadata.subagent = true;
+      turnMetadata.subagent_name = subagentName;
+    }
+
     const span = this.traceState.tracer.startSpan("opencode.turn", {
       attributes: {
         "langfuse.observation.type": "span",
         "langfuse.internal.is_app_root": true,
         "session.id": input.sessionID,
-        "langfuse.observation.input": JSON.stringify(formattedInput),
-        "langfuse.observation.metadata": JSON.stringify({
-          messageID: input.messageID,
-          agent: input.agent,
-          providerID: input.model?.providerID,
-          modelID: input.model?.modelID,
-        }),
+        "langfuse.observation.input": serializedInput,
+        "langfuse.observation.metadata": JSON.stringify(turnMetadata),
       },
     });
 
@@ -403,13 +486,8 @@ export class LangfuseClient {
         attributes: {
           "langfuse.observation.type": "event",
           "session.id": input.sessionID,
-          "langfuse.observation.input": JSON.stringify(formattedInput),
-          "langfuse.observation.metadata": JSON.stringify({
-            messageID: input.messageID,
-            agent: input.agent,
-            providerID: input.model?.providerID,
-            modelID: input.model?.modelID,
-          }),
+          "langfuse.observation.input": serializedInput,
+          "langfuse.observation.metadata": JSON.stringify(turnMetadata),
         },
       });
 
@@ -472,8 +550,37 @@ export class LangfuseClient {
     }
     const step = this.traceState.activeGenerationSteps.get(input.sessionID);
 
+    const fullModelName = formatModelName(input.providerID, input.modelID);
+
+    const generationInput = this.captureInput
+      ? this.getEffectiveGenerationInput(input.sessionID, input.parentID)
+      : undefined;
+
+    const subagentInfo = input.parentID
+      ? this.traceState.subagentInfoByMessageId.get(input.parentID)
+      : undefined;
+
+    const generationMetadata: Record<string, unknown> = {
+      messageID: input.messageID,
+      parentID: input.parentID,
+      agent: input.agent,
+      providerID: input.providerID,
+      mode: input.mode,
+      stage: input.mode,
+      finish: input.finish,
+      variant: step?.model?.variant,
+      snapshot: step?.snapshot,
+    };
+
+    if (subagentInfo) {
+      generationMetadata.subagent = true;
+      generationMetadata.subagent_name = subagentInfo.agent;
+    }
+
     if (step) {
-      step.span.setAttribute("langfuse.observation.model.name", input.modelID);
+      step.span.setAttribute("langfuse.observation.model.name", fullModelName);
+      step.span.setAttribute("gen_ai.system", input.providerID);
+      step.span.setAttribute("gen_ai.request.model", input.modelID);
       step.span.setAttribute(
         "langfuse.observation.output",
         JSON.stringify(output),
@@ -497,17 +604,12 @@ export class LangfuseClient {
       );
       step.span.setAttribute(
         "langfuse.observation.metadata",
-        JSON.stringify({
-          messageID: input.messageID,
-          parentID: input.parentID,
-          agent: input.agent,
-          providerID: input.providerID,
-          mode: input.mode,
-          finish: input.finish,
-          variant: step.model?.variant,
-          snapshot: step.snapshot,
-        }),
+        JSON.stringify(generationMetadata),
       );
+
+      if (generationInput) {
+        step.span.setAttribute("langfuse.observation.input", generationInput);
+      }
 
       this.traceState.generationSpansByMessageId.set(
         input.messageID,
@@ -526,34 +628,35 @@ export class LangfuseClient {
     }
 
     this.withTurnParent(input.sessionID, input.parentID, () => {
+      const spanAttributes: Record<string, string> = {
+        "langfuse.observation.type": "generation",
+        "session.id": input.sessionID,
+        "langfuse.observation.model.name": fullModelName,
+        "gen_ai.system": input.providerID,
+        "gen_ai.request.model": input.modelID,
+        "langfuse.observation.output": JSON.stringify(output),
+        "langfuse.observation.usage_details": JSON.stringify({
+          input: input.tokens.input,
+          output: input.tokens.output,
+          reasoning: input.tokens.reasoning,
+          cache_read: input.tokens.cache.read,
+          cache_write: input.tokens.cache.write,
+          total:
+            input.tokens.total ??
+            input.tokens.input + input.tokens.output + input.tokens.reasoning,
+        }),
+        "langfuse.observation.cost_details": JSON.stringify({
+          total: input.cost,
+        }),
+        "langfuse.observation.metadata": JSON.stringify(generationMetadata),
+      };
+
+      if (generationInput) {
+        spanAttributes["langfuse.observation.input"] = generationInput;
+      }
+
       const span = this.traceState.tracer.startSpan("opencode.generation", {
-        attributes: {
-          "langfuse.observation.type": "generation",
-          "session.id": input.sessionID,
-          "langfuse.observation.model.name": input.modelID,
-          "langfuse.observation.output": JSON.stringify(output),
-          "langfuse.observation.usage_details": JSON.stringify({
-            input: input.tokens.input,
-            output: input.tokens.output,
-            reasoning: input.tokens.reasoning,
-            cache_read: input.tokens.cache.read,
-            cache_write: input.tokens.cache.write,
-            total:
-              input.tokens.total ??
-              input.tokens.input + input.tokens.output + input.tokens.reasoning,
-          }),
-          "langfuse.observation.cost_details": JSON.stringify({
-            total: input.cost,
-          }),
-          "langfuse.observation.metadata": JSON.stringify({
-            messageID: input.messageID,
-            parentID: input.parentID,
-            agent: input.agent,
-            providerID: input.providerID,
-            mode: input.mode,
-            finish: input.finish,
-          }),
-        },
+        attributes: spanAttributes,
         startTime: new Date(input.created),
       });
 
@@ -769,6 +872,42 @@ export class LangfuseClient {
     this.traceState.activeToolObservations.delete(input.callID);
   }
 
+  private getEffectiveGenerationInput(
+    sessionID: string,
+    parentID?: string,
+  ): string | undefined {
+    if (!this.captureInput) {
+      return undefined;
+    }
+
+    if (parentID) {
+      const subagentInput = this.traceState.turnInputsByMessageId.get(
+        `${parentID}:subagent`,
+      );
+      if (subagentInput) {
+        return subagentInput;
+      }
+
+      const turnInput = this.traceState.turnInputsByMessageId.get(parentID);
+      if (turnInput) {
+        return turnInput;
+      }
+    }
+
+    const latestTurn =
+      this.traceState.latestTurnObservationsBySession.get(sessionID);
+    if (latestTurn?.messageID) {
+      const turnInput = this.traceState.turnInputsByMessageId.get(
+        latestTurn.messageID,
+      );
+      if (turnInput) {
+        return turnInput;
+      }
+    }
+
+    return undefined;
+  }
+
   private ensureGenerationParent(sessionID: string) {
     if (
       this.traceState.activeGenerationSteps.has(sessionID) ||
@@ -872,6 +1011,8 @@ export type LangfuseTraceState = {
   assistantParts: Map<string, Map<string, MessagePart>>;
   turnObservationsByMessageId: Map<string, TurnObservation>;
   latestTurnObservationsBySession: Map<string, TurnObservation>;
+  turnInputsByMessageId: Map<string, string>;
+  subagentInfoByMessageId: Map<string, { agent?: string }>;
   activeToolObservations: Map<string, ToolObservation>;
   activeGenerationSteps: Map<string, ActiveGenerationStep>;
   generationParentSpans: Map<string, ApiSpan>;
@@ -1009,6 +1150,7 @@ export const createLangfuseClient = (input: {
   baseUrl: string;
   environment: string;
   userId?: string;
+  captureInput?: boolean;
 }) =>
   Effect.gen(function* () {
     const tracerName = "opencode-langfuse-plugin";
@@ -1028,6 +1170,8 @@ export const createLangfuseClient = (input: {
       assistantParts: new Map<string, Map<string, MessagePart>>(),
       turnObservationsByMessageId: new Map<string, TurnObservation>(),
       latestTurnObservationsBySession: new Map<string, TurnObservation>(),
+      turnInputsByMessageId: new Map<string, string>(),
+      subagentInfoByMessageId: new Map<string, { agent?: string }>(),
       activeToolObservations: new Map<string, ToolObservation>(),
       activeGenerationSteps: new Map<string, ActiveGenerationStep>(),
       generationParentSpans: new Map<string, ApiSpan>(),
@@ -1071,5 +1215,6 @@ export const createLangfuseClient = (input: {
         );
         yield* Effect.tryPromise(() => sdk.shutdown());
       }),
+      captureInput: input.captureInput,
     });
   });
