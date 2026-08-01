@@ -1,4 +1,6 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { Effect, Schema } from "effect";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { LangfuseConfigSchema } from "../index.js";
 import {
   LangfuseClient,
   formatModelName,
@@ -6,6 +8,14 @@ import {
   truncateInput,
 } from "../langfuse.js";
 import type { LangfuseTraceState } from "../langfuse.js";
+import { createDebugPreview, debugLog, sanitizeLogText } from "../utils.js";
+
+const createMockSpan = () => ({
+  setAttribute: vi.fn(),
+  setStatus: vi.fn(),
+  recordException: vi.fn(),
+  end: vi.fn(),
+});
 
 describe("LangfuseClient", () => {
   let client: LangfuseClient;
@@ -19,6 +29,7 @@ describe("LangfuseClient", () => {
       tracedMessageIds: new Set(),
       tracedGenerationIds: new Set(),
       tracedEventIds: new Set(),
+      tracedEventIdsBySession: new Map(),
       tracedReasoningIds: new Set(),
       pendingReasoningPartsByMessageId: new Map(),
       generationSpansByMessageId: new Map(),
@@ -27,7 +38,9 @@ describe("LangfuseClient", () => {
       latestTurnObservationsBySession: new Map(),
       turnInputsByMessageId: new Map(),
       subagentInfoByMessageId: new Map(),
+      agentByMessageId: new Map(),
       activeToolObservations: new Map(),
+      finalizedToolCallIds: new Map(),
       activeGenerationSteps: new Map(),
       generationParentSpans: new Map(),
     };
@@ -42,6 +55,64 @@ describe("LangfuseClient", () => {
   });
 
   describe("clearTraceState", () => {
+    it("clears only the requested session state", () => {
+      mockTraceState.assistantParts.set(
+        "assistant-a",
+        new Map([
+          [
+            "part-a",
+            {
+              id: "part-a",
+              sessionID: "session-a",
+              messageID: "assistant-a",
+              type: "text",
+              text: "a",
+            } as any,
+          ],
+        ]),
+      );
+      mockTraceState.assistantParts.set(
+        "assistant-b",
+        new Map([
+          [
+            "part-b",
+            {
+              id: "part-b",
+              sessionID: "session-b",
+              messageID: "assistant-b",
+              type: "text",
+              text: "b",
+            } as any,
+          ],
+        ]),
+      );
+      mockTraceState.tracedEventIds.add("event-a");
+      mockTraceState.tracedEventIds.add("event-b");
+      mockTraceState.tracedEventIdsBySession.set(
+        "session-a",
+        new Set(["event-a"]),
+      );
+      mockTraceState.tracedEventIdsBySession.set(
+        "session-b",
+        new Set(["event-b"]),
+      );
+      mockTraceState.tracedReasoningIds.add("session-a:reasoning");
+      mockTraceState.tracedReasoningIds.add("session-b:reasoning");
+
+      client.clearTraceState("session-a");
+
+      expect(mockTraceState.assistantParts.has("assistant-a")).toBe(false);
+      expect(mockTraceState.assistantParts.has("assistant-b")).toBe(true);
+      expect(mockTraceState.tracedEventIds.has("event-a")).toBe(false);
+      expect(mockTraceState.tracedEventIds.has("event-b")).toBe(true);
+      expect(mockTraceState.tracedReasoningIds.has("session-a:reasoning")).toBe(
+        false,
+      );
+      expect(mockTraceState.tracedReasoningIds.has("session-b:reasoning")).toBe(
+        true,
+      );
+    });
+
     it("should clear all trace state maps", () => {
       mockTraceState.tracedMessageIds.add("msg-1");
       mockTraceState.tracedGenerationIds.add("gen-1");
@@ -184,5 +255,318 @@ describe("LangfuseClient", () => {
         agent: "test-agent",
       });
     });
+  });
+
+  describe("generation observability", () => {
+    it("maps provided and derived fields without duplicating tool payloads", () => {
+      const span = createMockSpan();
+      mockTraceState.activeGenerationSteps.set("session-1", {
+        span: span as any,
+        agent: "build",
+        model: { id: "coding-plan", providerID: "litellm" },
+      });
+      mockTraceState.abortedSessions.add("session-1");
+      mockTraceState.assistantParts.set(
+        "assistant-1",
+        new Map(
+          [
+            {
+              id: "step-1",
+              sessionID: "session-1",
+              messageID: "assistant-1",
+              type: "step-start",
+            },
+            {
+              id: "step-2",
+              sessionID: "session-1",
+              messageID: "assistant-1",
+              type: "step-start",
+            },
+            {
+              id: "finish-1",
+              sessionID: "session-1",
+              messageID: "assistant-1",
+              type: "step-finish",
+              reason: "stop",
+              cost: 0.1,
+              tokens: {
+                input: 1,
+                output: 2,
+                reasoning: 3,
+                cache: { read: 4, write: 5 },
+              },
+            },
+            {
+              id: "tool-1",
+              sessionID: "session-1",
+              messageID: "assistant-1",
+              type: "tool",
+              callID: "call-1",
+              tool: "read",
+              state: {
+                status: "completed",
+                input: { path: "secret-file" },
+                output: "sensitive output",
+                title: "Read",
+                metadata: {},
+                time: { start: 10, end: 20 },
+              },
+            },
+            {
+              id: "tool-2",
+              sessionID: "session-1",
+              messageID: "assistant-1",
+              type: "tool",
+              callID: "call-2",
+              tool: "bash",
+              state: {
+                status: "error",
+                input: { command: "false" },
+                error: "failed",
+                time: { start: 20, end: 30 },
+              },
+            },
+          ].map((part) => [part.id, part as any]),
+        ),
+      );
+
+      client.traceGeneration({
+        sessionID: "session-1",
+        messageID: "assistant-1",
+        parentID: "user-1",
+        modelID: "coding-plan",
+        providerID: "litellm",
+        mode: "build",
+        created: 1_000,
+        completed: 1_450,
+        cost: 0.25,
+        tokens: {
+          input: 100,
+          output: 50,
+          reasoning: 25,
+          cache: { read: 40, write: 10 },
+        },
+      });
+
+      const metadataCall = span.setAttribute.mock.calls.find(
+        ([name]) => name === "langfuse.observation.metadata",
+      );
+      const metadata = JSON.parse(metadataCall?.[1] as string);
+
+      expect(metadata).toMatchObject({
+        agent: "build",
+        model: "coding-plan",
+        provider: "litellm",
+        message_id: "assistant-1",
+        parent_id: "user-1",
+        session_id: "session-1",
+        finish_reason: "stop",
+        input_tokens: 100,
+        output_tokens: 50,
+        cached_tokens: 40,
+        cache_write_tokens: 10,
+        cost: 0.25,
+        request_duration: 450,
+        iteration_count: 2,
+        aborted: true,
+        tool_calls: 2,
+        tool_results: 2,
+        tool_success: 1,
+        tool_errors: 1,
+      });
+      expect(metadata).not.toHaveProperty("router_alias");
+      expect(metadata).not.toHaveProperty("generation_id");
+      expect(metadata).not.toHaveProperty("exit_code");
+      expect(metadata).not.toHaveProperty("latency");
+      expect(JSON.stringify(metadata)).not.toContain("sensitive output");
+      expect(JSON.stringify(metadata)).not.toContain("secret-file");
+    });
+  });
+
+  describe("tool observations", () => {
+    it("marks tool errors from authoritative tool part state", () => {
+      const span = createMockSpan();
+      mockTraceState.tracer = {
+        startSpan: vi.fn(() => span),
+      } as any;
+
+      client.traceToolPart({
+        id: "tool-1",
+        sessionID: "session-1",
+        messageID: "assistant-1",
+        type: "tool",
+        callID: "call-1",
+        tool: "bash",
+        state: {
+          status: "error",
+          input: { command: "false" },
+          error: "exit 1",
+          time: { start: 100, end: 150 },
+        },
+      } as any);
+
+      expect(span.setStatus).toHaveBeenCalledWith({
+        code: 2,
+        message: "exit 1",
+      });
+      expect(span.end).toHaveBeenCalledWith(new Date(150));
+      expect(
+        Array.from(mockTraceState.finalizedToolCallIds.values()),
+      ).toContain("session-1");
+    });
+
+    it("keeps identical call IDs isolated between sessions", () => {
+      const firstSpan = createMockSpan();
+      const secondSpan = createMockSpan();
+      mockTraceState.tracer = {
+        startSpan: vi
+          .fn()
+          .mockReturnValueOnce(firstSpan)
+          .mockReturnValueOnce(secondSpan),
+      } as any;
+
+      client.traceToolStart({
+        sessionID: "session-a",
+        callID: "shared-call",
+        tool: "read",
+        args: {},
+      });
+      client.traceToolStart({
+        sessionID: "session-b",
+        callID: "shared-call",
+        tool: "read",
+        args: {},
+      });
+
+      expect(mockTraceState.activeToolObservations.size).toBe(2);
+
+      client.traceToolPart({
+        id: "tool-a",
+        sessionID: "session-a",
+        messageID: "assistant-a",
+        type: "tool",
+        callID: "shared-call",
+        tool: "read",
+        state: {
+          status: "completed",
+          input: {},
+          output: "a",
+          title: "Read",
+          metadata: {},
+          time: { start: 10, end: 20 },
+        },
+      } as any);
+
+      expect(firstSpan.end).toHaveBeenCalledWith(new Date(20));
+      expect(secondSpan.end).not.toHaveBeenCalled();
+      expect(mockTraceState.activeToolObservations.size).toBe(1);
+    });
+
+    it("waits for terminal tool state after an abort", () => {
+      const span = createMockSpan();
+      mockTraceState.tracer = {
+        startSpan: vi.fn(() => span),
+      } as any;
+      client.traceToolStart({
+        sessionID: "session-1",
+        callID: "call-1",
+        tool: "bash",
+        args: {},
+      });
+
+      client.traceSessionError({
+        sessionID: "session-1",
+        error: {
+          name: "MessageAbortedError",
+          data: { message: "aborted" },
+        },
+      });
+
+      expect(span.end).not.toHaveBeenCalled();
+
+      client.traceToolPart({
+        id: "tool-1",
+        sessionID: "session-1",
+        messageID: "assistant-1",
+        type: "tool",
+        callID: "call-1",
+        tool: "bash",
+        state: {
+          status: "error",
+          input: {},
+          error: "aborted",
+          time: { start: 100, end: 125 },
+        },
+      } as any);
+
+      expect(span.end).toHaveBeenCalledWith(new Date(125));
+      expect(span.setStatus).toHaveBeenCalledWith({
+        code: 2,
+        message: "aborted",
+      });
+    });
+  });
+});
+
+describe("debug configuration", () => {
+  it("does not require a logger when debug logging is disabled", async () => {
+    await expect(
+      Effect.runPromise(
+        debugLog(
+          { enabled: false, includePayloads: false },
+          "message.updated",
+          { session_id: "session-1" },
+        ),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it("accepts an omitted or explicit debug configuration", () => {
+    expect(
+      Schema.decodeUnknownSync(LangfuseConfigSchema)({
+        publicKey: "public",
+        secretKey: "secret",
+      }).debug,
+    ).toBeUndefined();
+
+    expect(
+      Schema.decodeUnknownSync(LangfuseConfigSchema)({
+        debug: { enabled: true, includePayloads: true },
+      }).debug,
+    ).toEqual({ enabled: true, includePayloads: true });
+  });
+
+  it("rejects invalid debug values", () => {
+    expect(() =>
+      Schema.decodeUnknownSync(LangfuseConfigSchema)({
+        debug: { enabled: "yes" },
+      }),
+    ).toThrow();
+  });
+
+  it("redacts and truncates debug previews", () => {
+    const credentialPreview = createDebugPreview({
+      authorization: "Bearer top-secret-token",
+    });
+    const longPreview = createDebugPreview({
+      value: "x".repeat(1_000),
+    });
+
+    expect(credentialPreview).toContain("[REDACTED]");
+    expect(credentialPreview).not.toContain("top-secret-token");
+    expect(longPreview).toContain("[truncated]");
+    expect(sanitizeLogText("api_key=private-value")).not.toContain(
+      "private-value",
+    );
+    const credentials = sanitizeLogText(
+      '{"password":"alpha beta","authorization":"Basic abc123"}',
+    );
+    expect(credentials).toContain('"password":[REDACTED]');
+    expect(credentials).not.toContain("alpha beta");
+    expect(credentials).not.toContain("Basic abc123");
+    expect(sanitizeLogText('{"password":"alpha\\"beta"}')).not.toContain(
+      "beta",
+    );
+    expect(sanitizeLogText('password: "alpha\nbeta"')).not.toContain("beta");
   });
 });

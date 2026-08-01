@@ -32,6 +32,9 @@ export const truncateInput = (text: string): string =>
 export const formatModelName = (providerID: string, modelID: string): string =>
   `${providerID}/${modelID}`;
 
+const formatToolObservationKey = (sessionID: string, callID: string) =>
+  JSON.stringify([sessionID, callID]);
+
 export class LangfuseClient {
   readonly baseUrl: string;
   readonly forceFlush: Effect.Effect<void, unknown>;
@@ -53,10 +56,66 @@ export class LangfuseClient {
     this.captureInput = input.captureInput ?? false;
   }
 
-  clearTraceState() {
+  clearTraceState(sessionID?: string) {
+    if (sessionID) {
+      const messageIDs = new Set<string>();
+
+      for (const [messageID, parts] of this.traceState.assistantParts) {
+        if (
+          Array.from(parts.values()).some(
+            (part) => part.sessionID === sessionID,
+          )
+        ) {
+          messageIDs.add(messageID);
+        }
+      }
+
+      for (const [messageID, observation] of this.traceState
+        .turnObservationsByMessageId) {
+        if (observation.sessionID === sessionID) {
+          messageIDs.add(messageID);
+        }
+      }
+
+      for (const messageID of messageIDs) {
+        this.traceState.assistantParts.delete(messageID);
+        this.traceState.pendingReasoningPartsByMessageId.delete(messageID);
+        this.traceState.generationSpansByMessageId.delete(messageID);
+        this.traceState.turnObservationsByMessageId.delete(messageID);
+        this.traceState.turnInputsByMessageId.delete(messageID);
+        this.traceState.turnInputsByMessageId.delete(`${messageID}:subagent`);
+        this.traceState.subagentInfoByMessageId.delete(messageID);
+        this.traceState.agentByMessageId.delete(messageID);
+      }
+
+      this.traceState.abortedSessions.delete(sessionID);
+      this.traceState.latestTurnObservationsBySession.delete(sessionID);
+      this.traceState.activeGenerationSteps.delete(sessionID);
+      this.traceState.generationParentSpans.delete(sessionID);
+      for (const eventID of this.traceState.tracedEventIdsBySession.get(
+        sessionID,
+      ) ?? []) {
+        this.traceState.tracedEventIds.delete(eventID);
+      }
+      this.traceState.tracedEventIdsBySession.delete(sessionID);
+      for (const reasoningID of this.traceState.tracedReasoningIds) {
+        if (reasoningID.startsWith(`${sessionID}:`)) {
+          this.traceState.tracedReasoningIds.delete(reasoningID);
+        }
+      }
+      for (const [callID, finalizedSessionID] of this.traceState
+        .finalizedToolCallIds) {
+        if (finalizedSessionID === sessionID) {
+          this.traceState.finalizedToolCallIds.delete(callID);
+        }
+      }
+      return;
+    }
+
     this.traceState.assistantParts.clear();
     this.traceState.abortedSessions.clear();
     this.traceState.tracedEventIds.clear();
+    this.traceState.tracedEventIdsBySession.clear();
     this.traceState.tracedReasoningIds.clear();
     this.traceState.pendingReasoningPartsByMessageId.clear();
     this.traceState.generationSpansByMessageId.clear();
@@ -65,6 +124,8 @@ export class LangfuseClient {
     this.traceState.latestTurnObservationsBySession.clear();
     this.traceState.turnInputsByMessageId.clear();
     this.traceState.subagentInfoByMessageId.clear();
+    this.traceState.agentByMessageId.clear();
+    this.traceState.finalizedToolCallIds.clear();
   }
 
   endActiveToolObservations(sessionID?: string, error?: SessionErrorInfo) {
@@ -86,6 +147,7 @@ export class LangfuseClient {
 
       observation.span.end();
       this.traceState.activeToolObservations.delete(callID);
+      this.traceState.finalizedToolCallIds.set(callID, observation.sessionID);
     }
   }
 
@@ -106,17 +168,26 @@ export class LangfuseClient {
         step.span.recordException({ message, name: error.name });
       }
 
-      step.span.end();
+      step.span.end(
+        step.completed === undefined ? undefined : new Date(step.completed),
+      );
       this.traceState.activeGenerationSteps.delete(activeSessionID);
       this.traceState.generationParentSpans.delete(activeSessionID);
     }
   }
 
-  endActiveTurnObservations() {
+  endActiveTurnObservations(sessionID?: string) {
     for (const observation of new Set(
       this.traceState.latestTurnObservationsBySession.values(),
     )) {
+      if (sessionID && observation.sessionID !== sessionID) {
+        continue;
+      }
       observation.span.end();
+    }
+
+    if (sessionID) {
+      return;
     }
 
     this.traceState.turnObservationsByMessageId.clear();
@@ -138,6 +209,13 @@ export class LangfuseClient {
     }
 
     this.traceState.tracedEventIds.add(input.id);
+    const sessionEventIds =
+      this.traceState.tracedEventIdsBySession.get(input.sessionID) ?? new Set();
+    sessionEventIds.add(input.id);
+    this.traceState.tracedEventIdsBySession.set(
+      input.sessionID,
+      sessionEventIds,
+    );
 
     const startEvent = () => {
       const span = this.traceState.tracer.startSpan(input.name, {
@@ -329,6 +407,13 @@ export class LangfuseClient {
     });
   }
 
+  completeActiveGenerationStep(sessionID: string, completed: number) {
+    const step = this.traceState.activeGenerationSteps.get(sessionID);
+    if (step) {
+      step.completed = completed;
+    }
+  }
+
   traceUserMessage(input: {
     sessionID: string;
     messageID?: string;
@@ -351,6 +436,9 @@ export class LangfuseClient {
 
     if (input.messageID) {
       this.traceState.tracedMessageIds.add(input.messageID);
+      if (input.agent) {
+        this.traceState.agentByMessageId.set(input.messageID, input.agent);
+      }
       if (isSubagent) {
         this.traceState.subagentInfoByMessageId.set(input.messageID, {
           agent: subagentName,
@@ -442,6 +530,10 @@ export class LangfuseClient {
       agent: input.agent,
       providerID: input.model?.providerID,
       modelID: input.model?.modelID,
+      message_id: input.messageID,
+      session_id: input.sessionID,
+      provider: input.model?.providerID,
+      model: input.model?.modelID,
     };
 
     if (fullModelName) {
@@ -508,16 +600,98 @@ export class LangfuseClient {
     this.traceState.assistantParts.set(part.messageID, parts);
   }
 
+  traceToolPart(part: MessagePart) {
+    if (part.type !== "tool") {
+      return;
+    }
+
+    const state = part.state;
+    if (state.status === "pending") {
+      return;
+    }
+
+    if (state.status === "running") {
+      this.traceToolStart({
+        sessionID: part.sessionID,
+        messageID: part.messageID,
+        callID: part.callID,
+        tool: part.tool,
+        args: state.input,
+        started: state.time.start,
+      });
+      return;
+    }
+
+    const observationKey = formatToolObservationKey(
+      part.sessionID,
+      part.callID,
+    );
+
+    if (!this.traceState.activeToolObservations.has(observationKey)) {
+      this.traceToolStart({
+        sessionID: part.sessionID,
+        messageID: part.messageID,
+        callID: part.callID,
+        tool: part.tool,
+        args: state.input,
+        started: state.time.start,
+      });
+    }
+
+    const span =
+      this.traceState.activeToolObservations.get(observationKey)?.span;
+    if (!span) {
+      return;
+    }
+
+    const succeeded = state.status === "completed";
+    const metadata = {
+      callID: part.callID,
+      tool: part.tool,
+      call_id: part.callID,
+      message_id: part.messageID,
+      session_id: part.sessionID,
+      tool_success: succeeded,
+      tool_error: !succeeded,
+      request_duration: state.time.end - state.time.start,
+    };
+
+    span.setAttribute(
+      "langfuse.observation.output",
+      JSON.stringify(
+        succeeded
+          ? { title: state.title, output: state.output }
+          : { error: state.error },
+      ),
+    );
+    span.setAttribute(
+      "langfuse.observation.metadata",
+      JSON.stringify(metadata),
+    );
+
+    if (!succeeded) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: state.error });
+      span.recordException({
+        message: state.error,
+        name: "ToolExecutionError",
+      });
+    }
+
+    span.end(new Date(state.time.end));
+    this.traceState.activeToolObservations.delete(observationKey);
+    this.traceState.finalizedToolCallIds.set(observationKey, part.sessionID);
+  }
+
   traceGeneration(input: {
     sessionID: string;
     messageID: string;
     parentID: string;
     modelID: string;
     providerID: string;
-    agent?: string;
     mode: string;
     created: number;
     completed: number;
+    aborted?: boolean;
     finish?: string;
     cost: number;
     tokens: {
@@ -528,10 +702,6 @@ export class LangfuseClient {
       cache: { read: number; write: number };
     };
   }) {
-    if (this.traceState.abortedSessions.has(input.sessionID)) {
-      return;
-    }
-
     if (this.traceState.tracedGenerationIds.has(input.messageID)) {
       return;
     }
@@ -549,6 +719,12 @@ export class LangfuseClient {
       );
     }
     const step = this.traceState.activeGenerationSteps.get(input.sessionID);
+    const observability = this.getGenerationObservability(input.messageID);
+    const aborted =
+      input.aborted === true ||
+      this.traceState.abortedSessions.has(input.sessionID);
+    const agent =
+      step?.agent ?? this.traceState.agentByMessageId.get(input.parentID);
 
     const fullModelName = formatModelName(input.providerID, input.modelID);
 
@@ -563,13 +739,31 @@ export class LangfuseClient {
     const generationMetadata: Record<string, unknown> = {
       messageID: input.messageID,
       parentID: input.parentID,
-      agent: input.agent,
+      agent,
       providerID: input.providerID,
       mode: input.mode,
       stage: input.mode,
       finish: input.finish,
       variant: step?.model?.variant,
       snapshot: step?.snapshot,
+      message_id: input.messageID,
+      parent_id: input.parentID,
+      session_id: input.sessionID,
+      model: input.modelID,
+      provider: input.providerID,
+      finish_reason: input.finish ?? observability.finishReason,
+      input_tokens: input.tokens.input,
+      output_tokens: input.tokens.output,
+      cached_tokens: input.tokens.cache.read,
+      cache_write_tokens: input.tokens.cache.write,
+      cost: input.cost,
+      request_duration: input.completed - input.created,
+      iteration_count: observability.iterationCount,
+      aborted,
+      tool_calls: observability.toolCalls,
+      tool_results: observability.toolResults,
+      tool_success: observability.toolSuccess,
+      tool_errors: observability.toolErrors,
     };
 
     if (subagentInfo) {
@@ -617,7 +811,7 @@ export class LangfuseClient {
       );
       this.flushPendingReasoning(input.messageID, step.span);
 
-      step.span.end(new Date(input.completed));
+      step.span.end(new Date(step.completed ?? input.completed));
       this.traceState.activeGenerationSteps.delete(input.sessionID);
 
       return;
@@ -761,11 +955,27 @@ export class LangfuseClient {
   }
 
   traceSessionError(input: { sessionID: string; error?: SessionErrorInfo }) {
-    this.endActiveToolObservations(input.sessionID, input.error);
-    this.endActiveGenerationSteps(input.sessionID, input.error);
+    const aborted = input.error?.name === "MessageAbortedError";
 
-    if (input.error?.name === "MessageAbortedError") {
+    if (!aborted) {
+      this.endActiveToolObservations(input.sessionID, input.error);
+    }
+
+    if (aborted) {
       this.traceState.abortedSessions.add(input.sessionID);
+      const step = this.traceState.activeGenerationSteps.get(input.sessionID);
+      step?.span.setAttribute(
+        "langfuse.observation.metadata",
+        JSON.stringify({
+          agent: step.agent,
+          provider: step.model?.providerID,
+          model: step.model?.id,
+          session_id: input.sessionID,
+          aborted: true,
+        }),
+      );
+    } else {
+      this.endActiveGenerationSteps(input.sessionID, input.error);
     }
 
     const turn = this.getTurnObservation(input.sessionID, undefined);
@@ -782,7 +992,7 @@ export class LangfuseClient {
         JSON.stringify({ error: input.error }),
       );
 
-      if (input.error.name !== "MessageAbortedError") {
+      if (!aborted) {
         const message = this.getSessionErrorMessage(input.error);
 
         turn.span.setStatus({
@@ -791,6 +1001,10 @@ export class LangfuseClient {
         });
         turn.span.recordException({ message, name: input.error.name });
       }
+    }
+
+    if (aborted) {
+      return;
     }
 
     turn.span.end();
@@ -805,11 +1019,23 @@ export class LangfuseClient {
 
   traceToolStart(input: {
     sessionID: string;
+    messageID?: string;
     callID: string;
     tool: string;
     args: unknown;
+    started?: number;
   }) {
-    this.traceState.activeToolObservations.get(input.callID)?.span.end();
+    const observationKey = formatToolObservationKey(
+      input.sessionID,
+      input.callID,
+    );
+    if (
+      this.traceState.activeToolObservations.has(observationKey) ||
+      this.traceState.finalizedToolCallIds.has(observationKey)
+    ) {
+      return;
+    }
+
     this.ensureGenerationParent(input.sessionID);
 
     this.withObservationParent(input.sessionID, () => {
@@ -821,11 +1047,16 @@ export class LangfuseClient {
           "langfuse.observation.metadata": JSON.stringify({
             callID: input.callID,
             tool: input.tool,
+            call_id: input.callID,
+            message_id: input.messageID,
+            session_id: input.sessionID,
           }),
         },
+        startTime:
+          input.started === undefined ? undefined : new Date(input.started),
       });
 
-      this.traceState.activeToolObservations.set(input.callID, {
+      this.traceState.activeToolObservations.set(observationKey, {
         span,
         sessionID: input.sessionID,
         tool: input.tool,
@@ -841,7 +1072,15 @@ export class LangfuseClient {
     title: string;
     output: string;
   }) {
-    if (!this.traceState.activeToolObservations.has(input.callID)) {
+    const observationKey = formatToolObservationKey(
+      input.sessionID,
+      input.callID,
+    );
+    if (this.traceState.finalizedToolCallIds.has(observationKey)) {
+      return;
+    }
+
+    if (!this.traceState.activeToolObservations.has(observationKey)) {
       this.traceToolStart({
         sessionID: input.sessionID,
         callID: input.callID,
@@ -850,7 +1089,8 @@ export class LangfuseClient {
       });
     }
 
-    const span = this.traceState.activeToolObservations.get(input.callID)?.span;
+    const span =
+      this.traceState.activeToolObservations.get(observationKey)?.span;
 
     if (!span) {
       return;
@@ -865,11 +1105,43 @@ export class LangfuseClient {
       JSON.stringify({
         callID: input.callID,
         tool: input.tool,
+        call_id: input.callID,
+        session_id: input.sessionID,
       }),
     );
+  }
 
-    span.end();
-    this.traceState.activeToolObservations.delete(input.callID);
+  private getGenerationObservability(messageID: string) {
+    const parts = Array.from(
+      this.traceState.assistantParts.get(messageID)?.values() ?? [],
+    );
+    const tools = new Map(
+      parts
+        .filter(
+          (part): part is Extract<MessagePart, { type: "tool" }> =>
+            part.type === "tool",
+        )
+        .map((part) => [part.callID, part]),
+    );
+    const toolStates = Array.from(tools.values()).map(
+      (part) => part.state.status,
+    );
+    const stepParts = parts.filter((part) => part.type === "step-start");
+    const finishParts = parts.filter(
+      (part): part is Extract<MessagePart, { type: "step-finish" }> =>
+        part.type === "step-finish",
+    );
+
+    return {
+      finishReason: finishParts.at(-1)?.reason,
+      iterationCount: stepParts.length,
+      toolCalls: tools.size,
+      toolResults: toolStates.filter(
+        (status) => status === "completed" || status === "error",
+      ).length,
+      toolSuccess: toolStates.filter((status) => status === "completed").length,
+      toolErrors: toolStates.filter((status) => status === "error").length,
+    };
   }
 
   private getEffectiveGenerationInput(
@@ -1002,6 +1274,7 @@ export type LangfuseTraceState = {
   tracedMessageIds: Set<string>;
   tracedGenerationIds: Set<string>;
   tracedEventIds: Set<string>;
+  tracedEventIdsBySession: Map<string, Set<string>>;
   tracedReasoningIds: Set<string>;
   pendingReasoningPartsByMessageId: Map<
     string,
@@ -1013,7 +1286,9 @@ export type LangfuseTraceState = {
   latestTurnObservationsBySession: Map<string, TurnObservation>;
   turnInputsByMessageId: Map<string, string>;
   subagentInfoByMessageId: Map<string, { agent?: string }>;
+  agentByMessageId: Map<string, string>;
   activeToolObservations: Map<string, ToolObservation>;
+  finalizedToolCallIds: Map<string, string>;
   activeGenerationSteps: Map<string, ActiveGenerationStep>;
   generationParentSpans: Map<string, ApiSpan>;
 };
@@ -1099,6 +1374,7 @@ export type ActiveGenerationStep = {
   };
   span: ApiSpan;
   started?: number;
+  completed?: number;
   snapshot?: string;
 };
 
@@ -1161,6 +1437,7 @@ export const createLangfuseClient = (input: {
       tracedMessageIds: new Set<string>(),
       tracedGenerationIds: new Set<string>(),
       tracedEventIds: new Set<string>(),
+      tracedEventIdsBySession: new Map<string, Set<string>>(),
       tracedReasoningIds: new Set<string>(),
       pendingReasoningPartsByMessageId: new Map<
         string,
@@ -1172,7 +1449,9 @@ export const createLangfuseClient = (input: {
       latestTurnObservationsBySession: new Map<string, TurnObservation>(),
       turnInputsByMessageId: new Map<string, string>(),
       subagentInfoByMessageId: new Map<string, { agent?: string }>(),
+      agentByMessageId: new Map<string, string>(),
       activeToolObservations: new Map<string, ToolObservation>(),
+      finalizedToolCallIds: new Map<string, string>(),
       activeGenerationSteps: new Map<string, ActiveGenerationStep>(),
       generationParentSpans: new Map<string, ApiSpan>(),
     };

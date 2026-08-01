@@ -16,37 +16,37 @@ This document provides a comprehensive audit of the current OpenCode observabili
 
 ### 1.1 Core Lifecycle Events
 
-| Event Type | Handler | Purpose |
-|------------|---------|---------|
-| `session.idle` | `eventHook` | Triggers span flush and finalizes tracing |
+| Event Type                 | Handler     | Purpose                                                |
+| -------------------------- | ----------- | ------------------------------------------------------ |
+| `session.idle`             | `eventHook` | Triggers span flush and finalizes tracing              |
 | `server.instance.disposed` | `eventHook` | Shuts down Langfuse client and flushes remaining spans |
-| `session.error` | `eventHook` | Records session errors with error details |
+| `session.error`            | `eventHook` | Records session errors with error details              |
 
 ### 1.2 Message Events
 
-| Event Type | Handler | Purpose |
-|------------|---------|---------|
-| `message.updated` | `eventHook` | Records completed assistant generations with full metadata |
-| `message.part.updated` | `eventHook` | Tracks message parts (text, reasoning, tool calls) |
-| `chat.message` | `chat.message` hook | Creates user turn spans and captures user input |
+| Event Type             | Handler             | Purpose                                                    |
+| ---------------------- | ------------------- | ---------------------------------------------------------- |
+| `message.updated`      | `eventHook`         | Records completed assistant generations with full metadata |
+| `message.part.updated` | `eventHook`         | Tracks message parts (text, reasoning, tool calls)         |
+| `chat.message`         | `chat.message` hook | Creates user turn spans and captures user input            |
 
 ### 1.3 Tool Execution Events
 
-| Event Type | Handler | Purpose |
-|------------|---------|---------|
+| Event Type            | Handler                    | Purpose                       |
+| --------------------- | -------------------------- | ----------------------------- |
 | `tool.execute.before` | `tool.execute.before` hook | Starts tool observation spans |
-| `tool.execute.after` | `tool.execute.after` hook | Ends tool spans with results |
+| `tool.execute.after`  | `tool.execute.after` hook  | Ends tool spans with results  |
 
 ### 1.4 Session.Next Events (Extended Telemetry)
 
-| Event Type | Handler | Purpose |
-|------------|---------|---------|
-| `session.next.step.started` | `startActiveGenerationStep` | Tracks generation step lifecycle with model info |
-| `session.next.step.ended` | `endActiveGenerationSteps` | Finalizes generation steps |
-| `session.next.step.failed` | `traceFailedGenerationStep` | Records failed generation steps |
-| `session.next.retried` | `traceEvent` | Captures retry attempts with attempt number |
-| `session.next.reasoning.ended` | `traceReasoning` | Records reasoning/chain-of-thought output |
-| `session.next.compaction.ended` | `traceEvent` | Captures context compaction summaries |
+| Event Type                      | Handler                     | Purpose                                          |
+| ------------------------------- | --------------------------- | ------------------------------------------------ |
+| `session.next.step.started`     | `startActiveGenerationStep` | Tracks generation step lifecycle with model info |
+| `session.next.step.ended`       | `endActiveGenerationSteps`  | Finalizes generation steps                       |
+| `session.next.step.failed`      | `traceFailedGenerationStep` | Records failed generation steps                  |
+| `session.next.retried`          | `traceEvent`                | Captures retry attempts with attempt number      |
+| `session.next.reasoning.ended`  | `traceReasoning`            | Records reasoning/chain-of-thought output        |
+| `session.next.compaction.ended` | `traceEvent`                | Captures context compaction summaries            |
 
 ---
 
@@ -59,6 +59,7 @@ This document provides a comprehensive audit of the current OpenCode observabili
 **Lifecycle:** One per user message/session turn
 
 **Attributes:**
+
 ```typescript
 {
   "langfuse.observation.type": "span",
@@ -78,6 +79,7 @@ This document provides a comprehensive audit of the current OpenCode observabili
 ```
 
 **Child Observations:**
+
 - User message event
 - Generation spans
 - Tool observation spans
@@ -89,6 +91,7 @@ This document provides a comprehensive audit of the current OpenCode observabili
 **Parent:** `opencode.turn`
 
 **Attributes:**
+
 ```typescript
 {
   "langfuse.observation.type": "event",
@@ -105,6 +108,7 @@ This document provides a comprehensive audit of the current OpenCode observabili
 **Parent:** `opencode.turn` or generation parent span
 
 **Attributes:**
+
 ```typescript
 {
   "langfuse.observation.type": "generation",
@@ -141,6 +145,7 @@ This document provides a comprehensive audit of the current OpenCode observabili
 ```
 
 **Note:** When `captureInput` is enabled, also includes:
+
 ```typescript
 {
   "langfuse.observation.input": string // JSON: user message (redacted)
@@ -154,6 +159,7 @@ This document provides a comprehensive audit of the current OpenCode observabili
 **Status:** ERROR
 
 **Attributes:**
+
 ```typescript
 {
   "langfuse.observation.type": "generation",
@@ -171,6 +177,7 @@ This document provides a comprehensive audit of the current OpenCode observabili
 **Parent:** Generation span or turn span
 
 **Attributes:**
+
 ```typescript
 {
   "langfuse.observation.type": "tool",
@@ -194,6 +201,7 @@ This document provides a comprehensive audit of the current OpenCode observabili
 **Parent:** Generation span
 
 **Attributes:**
+
 ```typescript
 {
   "langfuse.observation.type": "event",
@@ -216,6 +224,7 @@ This document provides a comprehensive audit of the current OpenCode observabili
 **Parent:** Turn span
 
 **Attributes:**
+
 ```typescript
 {
   "langfuse.observation.type": "event",
@@ -234,6 +243,7 @@ This document provides a comprehensive audit of the current OpenCode observabili
 **Parent:** Turn span
 
 **Attributes:**
+
 ```typescript
 {
   "langfuse.observation.type": "event",
@@ -253,40 +263,40 @@ This document provides a comprehensive audit of the current OpenCode observabili
 
 ### 3.1 Session-Level Tracking
 
-| ID Type | Storage | Purpose |
-|---------|---------|---------|
-| `sessionID` | Multiple maps | Groups all observations within a session |
-| `messageID` | `turnObservationsByMessageId`, `generationSpansByMessageId` | Links user messages to assistant responses |
-| `parentID` | Generation metadata | Tracks parent message for nested conversations |
+| ID Type     | Storage                                                     | Purpose                                        |
+| ----------- | ----------------------------------------------------------- | ---------------------------------------------- |
+| `sessionID` | Multiple maps                                               | Groups all observations within a session       |
+| `messageID` | `turnObservationsByMessageId`, `generationSpansByMessageId` | Links user messages to assistant responses     |
+| `parentID`  | Generation metadata                                         | Tracks parent message for nested conversations |
 
 ### 3.2 Generation Tracking
 
-| ID Type | Storage | Purpose |
-|---------|---------|---------|
-| Generation step | `activeGenerationSteps` (Map by sessionID) | Tracks active LLM generation lifecycle |
-| Generation span | `generationParentSpans` (Map by sessionID) | Parent span for tool calls |
-| Message-to-span | `generationSpansByMessageId` | Links message ID to its generation span |
+| ID Type         | Storage                                    | Purpose                                 |
+| --------------- | ------------------------------------------ | --------------------------------------- |
+| Generation step | `activeGenerationSteps` (Map by sessionID) | Tracks active LLM generation lifecycle  |
+| Generation span | `generationParentSpans` (Map by sessionID) | Parent span for tool calls              |
+| Message-to-span | `generationSpansByMessageId`               | Links message ID to its generation span |
 
 ### 3.3 Tool Call Tracking
 
-| ID Type | Storage | Purpose |
-|---------|---------|---------|
+| ID Type  | Storage                        | Purpose                          |
+| -------- | ------------------------------ | -------------------------------- |
 | `callID` | `activeToolObservations` (Map) | Correlates tool start/end events |
 
 ### 3.4 Reasoning Tracking
 
-| ID Type | Storage | Purpose |
-|---------|---------|---------|
-| `reasoningID` + `sessionID` | `tracedReasoningIds` (Set) | Prevents duplicate reasoning traces |
-| `reasoningID` | Stored in metadata | Links reasoning to specific generation |
+| ID Type                     | Storage                    | Purpose                                |
+| --------------------------- | -------------------------- | -------------------------------------- |
+| `reasoningID` + `sessionID` | `tracedReasoningIds` (Set) | Prevents duplicate reasoning traces    |
+| `reasoningID`               | Stored in metadata         | Links reasoning to specific generation |
 
 ### 3.5 Event Deduplication
 
-| ID Type | Storage | Purpose |
-|---------|---------|---------|
-| Message ID | `tracedMessageIds` (Set) | Prevents duplicate user message traces |
-| Generation ID | `tracedGenerationIds` (Set) | Prevents duplicate generation spans |
-| Event ID | `tracedEventIds` (Set) | Prevents duplicate event traces |
+| ID Type       | Storage                     | Purpose                                |
+| ------------- | --------------------------- | -------------------------------------- |
+| Message ID    | `tracedMessageIds` (Set)    | Prevents duplicate user message traces |
+| Generation ID | `tracedGenerationIds` (Set) | Prevents duplicate generation spans    |
+| Event ID      | `tracedEventIds` (Set)      | Prevents duplicate event traces        |
 
 ---
 
@@ -294,11 +304,11 @@ This document provides a comprehensive audit of the current OpenCode observabili
 
 ### 4.1 Global Metadata (All Spans)
 
-| Attribute | Description | Source |
-|-----------|-------------|--------|
-| `langfuse.user.id` | Optional user identifier | Config/env var `LANGFUSE_USER_ID` |
-| `langfuse.plugin.version` | Plugin version | `version.ts` |
-| `session.id` | OpenCode session ID | Event properties |
+| Attribute                 | Description              | Source                            |
+| ------------------------- | ------------------------ | --------------------------------- |
+| `langfuse.user.id`        | Optional user identifier | Config/env var `LANGFUSE_USER_ID` |
+| `langfuse.plugin.version` | Plugin version           | `version.ts`                      |
+| `session.id`              | OpenCode session ID      | Event properties                  |
 
 ### 4.2 Turn-Level Metadata
 
@@ -337,7 +347,7 @@ This document provides a comprehensive audit of the current OpenCode observabili
 
 ```typescript
 {
-  total: number // Total cost in USD
+  total: number; // Total cost in USD
 }
 ```
 
@@ -364,12 +374,14 @@ This document provides a comprehensive audit of the current OpenCode observabili
 ### 5.1 Input Redaction
 
 The `redactSecrets` function removes:
+
 - OpenAI-style API keys: `sk-[a-zA-Z0-9]{20,}`
 - Public keys: `pk-[a-zA-Z0-9]{20,}`
 - Bearer tokens: `Bearer [token]`
 - API key patterns: `api_key: "[value]"`
 
 **Limitations:**
+
 - Pattern-based only; may miss custom secret formats
 - Does not redact PII (names, emails, etc.)
 - Does not redact file paths or code content
@@ -382,9 +394,9 @@ The `redactSecrets` function removes:
 
 ### 5.3 Capture Input Control
 
-- Opt-in via `captureInput` flag (default: `false`)
-- Can be set via config or environment variable
-- Applies to user messages and generation inputs
+- `captureInput` is opt-in for the copy of turn input attached to generations.
+- It can be set via config or environment variable.
+- Turn and user-message observations currently receive serialized input regardless of this option. This is a known privacy gap and must not be described as fully opt-in.
 
 ---
 
@@ -436,7 +448,7 @@ The `redactSecrets` function removes:
 
 - ⚠️ **Partial reasoning**: Only completed reasoning captured
 - ❌ **Reasoning segments**: No breakdown of reasoning phases
-- ❌ **Thinking tokens**: Not separately tracked from output tokens
+- ✅ **Thinking tokens**: Exported separately as `reasoning` usage
 
 ### 6.7 Session Lifecycle
 
@@ -459,14 +471,14 @@ The `redactSecrets` function removes:
 
 **File:** `src/__tests__/langfuse.test.ts`
 
-| Test Suite | Coverage | Quality |
-|------------|----------|---------|
-| `clearTraceState` | Verifies state maps are cleared | ✅ Good |
-| `captureInput` | Tests capture input flag | ⚠️ Basic |
-| `formatModelName` | Tests model name formatting | ✅ Good |
-| `redactSecrets` | Tests secret redaction patterns | ✅ Good |
-| `truncateInput` | Tests input truncation | ✅ Good |
-| `trace state new maps` | Tests new map structures | ⚠️ Basic |
+| Test Suite             | Coverage                        | Quality  |
+| ---------------------- | ------------------------------- | -------- |
+| `clearTraceState`      | Verifies state maps are cleared | ✅ Good  |
+| `captureInput`         | Tests capture input flag        | ⚠️ Basic |
+| `formatModelName`      | Tests model name formatting     | ✅ Good  |
+| `redactSecrets`        | Tests secret redaction patterns | ✅ Good  |
+| `truncateInput`        | Tests input truncation          | ✅ Good  |
+| `trace state new maps` | Tests new map structures        | ⚠️ Basic |
 
 ### 7.2 Test Gaps
 
@@ -482,11 +494,13 @@ The `redactSecrets` function removes:
 ### 7.3 Test Quality Assessment
 
 **Strengths:**
+
 - Good coverage of utility functions
 - Tests core data transformations
 - Validates security features (redaction)
 
 **Weaknesses:**
+
 - Mock-heavy without real integration
 - No behavioral tests for complex logic
 - No regression tests for bugs
@@ -506,7 +520,7 @@ The `redactSecrets` function removes:
 ✅ **Extensibility**: Clean architecture with Effect-based design  
 ✅ **Error handling**: Graceful error handling with Effect  
 ✅ **Type safety**: Full TypeScript implementation  
-✅ **Active state management**: Proper cleanup on session end  
+✅ **Active state management**: Proper cleanup on session end
 
 ### 8.2 Weaknesses
 
@@ -515,17 +529,19 @@ The `redactSecrets` function removes:
 ⚠️ **No observability of observability**: No metrics on plugin performance  
 ⚠️ **Hard-coded limits**: Fixed truncation length, no config  
 ⚠️ **Inconsistent naming**: Mix of `opencode.*` and tool names  
-⚠️ **No version migration**: No strategy for schema changes  
+⚠️ **No version migration**: No strategy for schema changes
 
 ### 8.3 Code Quality
 
 **Architecture:**
+
 - Effect-based dependency injection ✅
 - Clean separation of concerns ✅
 - Proper resource cleanup ✅
 - Good use of OpenTelemetry APIs ✅
 
 **Maintainability:**
+
 - Type-safe ✅
 - Modular design ✅
 - Clear naming (mostly) ✅
@@ -566,12 +582,14 @@ The `redactSecrets` function removes:
 The plugin provides solid foundational observability for OpenCode sessions, capturing the core flow of user messages, LLM generations, and tool calls. The implementation is well-architected with proper state management and security features.
 
 **Key gaps:**
+
 - Limited test coverage
 - No explicit session tracking
 - Missing context (git, workspace, system prompts)
 - No plugin performance metrics
 
 **Next steps:**
+
 1. Add comprehensive integration tests
 2. Document the span schema formally
 3. Add session-level tracking

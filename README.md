@@ -31,7 +31,11 @@ Create `~/.config/opencode/opencode-langfuse.json` with your Langfuse credential
   "secretKey": "sk-lf-...",
   "baseUrl": "https://cloud.langfuse.com",
   "environment": "development",
-  "userId": "your-user-id"
+  "userId": "your-user-id",
+  "debug": {
+    "enabled": false,
+    "includePayloads": false
+  }
 }
 ```
 
@@ -47,7 +51,15 @@ export LANGFUSE_ENVIRONMENT="development"
 export LANGFUSE_USER_ID="your-user-id"
 ```
 
-If both `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set, the plugin uses environment variables instead of reading the config file. Optional values can be supplied either way.
+Environment variables override matching credential and optional fields from the config file. The file is still read for options such as `debug` when credentials come from the environment.
+
+## Debug Logging
+
+Set `debug.enabled` to `true` to log OpenCode event types, correlation IDs, model fields, statuses, and payload shape information. Debug logging is disabled by default.
+
+`debug.includePayloads` adds only short, redacted structural previews. Complete prompts, file contents, tool arguments, tool output, headers, and credentials are never written to debug logs. Restart OpenCode after changing this configuration.
+
+See [Coding Agent Observability Gap Plan](./docs/observability-gap-plan.md) for the emitted field contract and explicitly unavailable OpenCode data.
 
 ## License
 

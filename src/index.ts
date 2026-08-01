@@ -12,7 +12,13 @@ import {
   type LangfuseClient,
 } from "./langfuse.js";
 import { OpencodeClientService } from "./opencode.js";
-import { log } from "./utils.js";
+import {
+  createDebugPreview,
+  debugLog,
+  log,
+  sanitizeLogText,
+  type DebugConfig,
+} from "./utils.js";
 
 // opencode emits these session.next.* events at runtime, but the published
 // @opencode-ai/plugin Hooks["event"] type still omits them from its Event union.
@@ -78,35 +84,35 @@ type OpencodeEvent =
   | Parameters<NonNullable<Hooks["event"]>>[0]["event"]
   | SessionNextEvent;
 
-const LangfuseCredentialsSchema = Schema.Struct({
-  publicKey: Schema.NonEmptyString,
-  secretKey: Schema.NonEmptyString,
+export const LangfuseConfigSchema = Schema.Struct({
+  publicKey: Schema.optional(Schema.NonEmptyString),
+  secretKey: Schema.optional(Schema.NonEmptyString),
   baseUrl: Schema.optional(Schema.NonEmptyString),
   environment: Schema.optional(Schema.NonEmptyString),
   userId: Schema.optional(Schema.NonEmptyString),
   captureInput: Schema.optional(Schema.Boolean),
+  debug: Schema.optional(
+    Schema.Struct({
+      enabled: Schema.optional(Schema.Boolean),
+      includePayloads: Schema.optional(Schema.Boolean),
+    }),
+  ),
 });
 
-type LangfuseCredentials = typeof LangfuseCredentialsSchema.Type;
+type LangfuseFileConfig = typeof LangfuseConfigSchema.Type;
+type LangfuseCredentials = LangfuseFileConfig & {
+  publicKey: string;
+  secretKey: string;
+};
 
 class MissingLangfuseCredentials extends Data.TaggedError(
   "MissingLangfuseCredentials",
 ) {}
 
 const loadLangfuseCredentials = Effect.gen(function* () {
-  const publicKey = process.env.LANGFUSE_PUBLIC_KEY;
-  const secretKey = process.env.LANGFUSE_SECRET_KEY;
-
-  if (publicKey && secretKey) {
-    return {
-      publicKey,
-      secretKey,
-      baseUrl: process.env.LANGFUSE_BASEURL,
-      environment: process.env.LANGFUSE_ENVIRONMENT,
-      userId: process.env.LANGFUSE_USER_ID,
-    } satisfies LangfuseCredentials;
-  }
-
+  const hasEnvironmentCredentials = Boolean(
+    process.env.LANGFUSE_PUBLIC_KEY && process.env.LANGFUSE_SECRET_KEY,
+  );
   const configPath = join(
     homedir(),
     ".config",
@@ -114,35 +120,105 @@ const loadLangfuseCredentials = Effect.gen(function* () {
     "opencode-langfuse.json",
   );
 
-  const credentials = yield* Effect.tryPromise({
-    try: async () => JSON.parse(await readFile(configPath, "utf8")),
-    catch: () => new MissingLangfuseCredentials(),
-  }).pipe(
-    Effect.flatMap(Schema.decodeUnknown(LangfuseCredentialsSchema)),
-    Effect.mapError(() => new MissingLangfuseCredentials()),
-  );
+  const configContents = yield* Effect.tryPromise({
+    try: () => readFile(configPath, "utf8"),
+    catch: () => undefined,
+  }).pipe(Effect.catchAll(() => Effect.succeed(undefined)));
+  const fileConfig: LangfuseFileConfig = configContents
+    ? yield* Effect.try({
+        try: () => JSON.parse(configContents),
+        catch: () => new MissingLangfuseCredentials(),
+      }).pipe(
+        Effect.flatMap(Schema.decodeUnknown(LangfuseConfigSchema)),
+        Effect.mapError(() => new MissingLangfuseCredentials()),
+        Effect.catchAll(() =>
+          hasEnvironmentCredentials
+            ? log(
+                "warn",
+                `[Tracing config ignored] Invalid ${configPath}; using environment credentials`,
+              ).pipe(Effect.as({} as LangfuseFileConfig))
+            : Effect.fail(new MissingLangfuseCredentials()),
+        ),
+      )
+    : ({} as LangfuseFileConfig);
 
-  if (!credentials.publicKey || !credentials.secretKey) {
+  const publicKey = process.env.LANGFUSE_PUBLIC_KEY ?? fileConfig.publicKey;
+  const secretKey = process.env.LANGFUSE_SECRET_KEY ?? fileConfig.secretKey;
+
+  if (!publicKey || !secretKey) {
     return yield* Effect.fail(new MissingLangfuseCredentials());
   }
 
-  return credentials;
+  return { ...fileConfig, publicKey, secretKey } satisfies LangfuseCredentials;
 });
 
-const eventHook = (event: OpencodeEvent, shutdown?: () => Promise<void>) =>
+const asRecord = (value: unknown): Record<string, unknown> | undefined =>
+  value !== null && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : undefined;
+
+const getEventDebugDetails = (event: OpencodeEvent) => {
+  const properties = asRecord(event.properties) ?? {};
+  const info = asRecord(properties.info);
+  const part = asRecord(properties.part);
+  const state = asRecord(part?.state);
+  const sessionID = properties.sessionID ?? info?.sessionID ?? part?.sessionID;
+  const messageID = properties.messageID ?? info?.id ?? part?.messageID;
+
+  return {
+    metadata: {
+      event_id: "id" in event ? event.id : undefined,
+      session_id: sessionID,
+      message_id: messageID,
+      parent_id: info?.parentID,
+      call_id: part?.callID,
+      part_type: part?.type,
+      tool: part?.tool,
+      status: state?.status,
+      provider: info?.providerID,
+      model: info?.modelID,
+    },
+    payloadSummary: {
+      property_keys: Object.keys(properties),
+      info_keys: info ? Object.keys(info) : undefined,
+      part_keys: part ? Object.keys(part) : undefined,
+      state_keys: state ? Object.keys(state) : undefined,
+      input_keys: Object.keys(asRecord(state?.input) ?? {}),
+      text_length:
+        typeof part?.text === "string" ? part.text.length : undefined,
+      output_length:
+        typeof state?.output === "string" ? state.output.length : undefined,
+      error_length:
+        typeof state?.error === "string" ? state.error.length : undefined,
+    },
+  };
+};
+
+const eventHook = (
+  event: OpencodeEvent,
+  debug: DebugConfig,
+  shutdown?: () => Promise<void>,
+) =>
   Effect.gen(function* () {
     const langfuse = yield* LangfuseClientService;
+    const debugDetails = getEventDebugDetails(event);
+    yield* debugLog(
+      debug,
+      event.type,
+      debugDetails.metadata,
+      debugDetails.payloadSummary,
+    );
 
-    const finalizeSessionTracing = () => {
-      langfuse.endActiveToolObservations();
-      langfuse.endActiveGenerationSteps();
-      langfuse.endActiveTurnObservations();
-      langfuse.clearTraceState();
+    const finalizeSessionTracing = (sessionID?: string) => {
+      langfuse.endActiveToolObservations(sessionID);
+      langfuse.endActiveGenerationSteps(sessionID);
+      langfuse.endActiveTurnObservations(sessionID);
+      langfuse.clearTraceState(sessionID);
     };
 
     if (event.type === "session.idle") {
       yield* log("info", "Flushing spans");
-      finalizeSessionTracing();
+      finalizeSessionTracing(event.properties.sessionID);
 
       yield* langfuse.forceFlush;
     }
@@ -168,6 +244,7 @@ const eventHook = (event: OpencodeEvent, shutdown?: () => Promise<void>) =>
     if (event.type === "message.part.updated") {
       langfuse.rememberAssistantPart(event.properties.part);
       langfuse.traceReasoningPart(event.properties.part);
+      langfuse.traceToolPart(event.properties.part);
     }
 
     if (event.type === "session.next.step.started") {
@@ -178,6 +255,13 @@ const eventHook = (event: OpencodeEvent, shutdown?: () => Promise<void>) =>
         started: event.properties.timestamp,
         snapshot: event.properties.snapshot,
       });
+    }
+
+    if (event.type === "session.next.step.ended") {
+      langfuse.completeActiveGenerationStep(
+        event.properties.sessionID,
+        event.properties.timestamp,
+      );
     }
 
     if (event.type === "session.next.step.failed") {
@@ -239,26 +323,26 @@ const eventHook = (event: OpencodeEvent, shutdown?: () => Promise<void>) =>
         parentID: message.parentID,
         modelID: message.modelID,
         providerID: message.providerID,
-        agent: message.mode,
         mode: message.mode,
         created: message.time.created,
         completed: message.time.completed,
         finish: message.finish,
         cost: message.cost,
         tokens: message.tokens,
+        aborted: message.error?.name === "MessageAbortedError",
       });
     }
   });
 
 const formatHookError = (error: unknown) => {
   if (error instanceof Error) {
-    return error.stack ?? error.message;
+    return createDebugPreview(error.stack ?? error.message);
   }
 
   try {
-    return JSON.stringify(error);
+    return createDebugPreview(error);
   } catch {
-    return String(error);
+    return sanitizeLogText(String(error));
   }
 };
 
@@ -277,26 +361,32 @@ const createShutdownOnce = (langfuse: LangfuseClient) => {
 const main = Effect.gen(function* () {
   const opencode = yield* OpencodeClientService;
 
-  const langfuse = yield* Effect.gen(function* () {
+  const tracing = yield* Effect.gen(function* () {
     const credentials = yield* loadLangfuseCredentials;
 
     const baseUrl =
-      credentials.baseUrl ??
       process.env.LANGFUSE_BASEURL ??
+      credentials.baseUrl ??
       "https://cloud.langfuse.com";
 
     const environment =
-      credentials.environment ??
       process.env.LANGFUSE_ENVIRONMENT ??
+      credentials.environment ??
       "development";
 
-    const userId = credentials.userId ?? process.env.LANGFUSE_USER_ID;
+    const userId = process.env.LANGFUSE_USER_ID ?? credentials.userId;
 
     const captureInput =
-      credentials.captureInput ??
-      (process.env.LANGFUSE_CAPTURE_INPUT === "true" || undefined);
+      process.env.LANGFUSE_CAPTURE_INPUT === undefined
+        ? credentials.captureInput
+        : process.env.LANGFUSE_CAPTURE_INPUT === "true";
 
-    return yield* createLangfuseClient({
+    const debug = {
+      enabled: credentials.debug?.enabled ?? false,
+      includePayloads: credentials.debug?.includePayloads ?? false,
+    } satisfies DebugConfig;
+
+    const client = yield* createLangfuseClient({
       publicKey: credentials.publicKey,
       secretKey: credentials.secretKey,
       baseUrl,
@@ -304,8 +394,10 @@ const main = Effect.gen(function* () {
       userId,
       captureInput,
     });
+
+    return { client, debug };
   }).pipe(
-    Effect.tap((client) =>
+    Effect.tap(({ client }) =>
       log("info", `OTEL tracing initialized → ${client.baseUrl}`),
     ),
     Effect.catchTag("MissingLangfuseCredentials", () =>
@@ -313,9 +405,11 @@ const main = Effect.gen(function* () {
     ),
   );
 
-  if (!langfuse) {
+  if (!tracing) {
     return {};
   }
+
+  const { client: langfuse, debug } = tracing;
 
   const hooksLayer = Layer.merge(
     Layer.succeed(OpencodeClientService, opencode),
@@ -384,53 +478,102 @@ const main = Effect.gen(function* () {
         }),
       ),
 
-    event: ({ event }) => runHook("event", eventHook(event, shutdownOnce)),
+    event: ({ event }) =>
+      runHook("event", eventHook(event, debug, shutdownOnce)),
 
     "chat.message": (input, output) =>
       runHook(
         "chat.message",
-        Effect.try({
-          try: () =>
-            langfuse.traceUserMessage({
-              sessionID: input.sessionID,
-              messageID: input.messageID,
-              agent: input.agent,
-              model: input.model,
-              parts: output.parts,
-            }),
-          catch: (error) => error,
+        Effect.gen(function* () {
+          const agent = input.agent ?? output.message.agent;
+          const model = input.model ?? output.message.model;
+          const messageID = input.messageID ?? output.message.id;
+          yield* debugLog(
+            debug,
+            "chat.message",
+            {
+              session_id: input.sessionID,
+              message_id: messageID,
+              agent,
+              provider: model?.providerID,
+              model: model?.modelID,
+            },
+            {
+              part_count: output.parts.length,
+              part_types: output.parts.map((part) => part.type),
+            },
+          );
+          yield* Effect.try({
+            try: () =>
+              langfuse.traceUserMessage({
+                sessionID: input.sessionID,
+                messageID,
+                agent,
+                model,
+                parts: output.parts,
+              }),
+            catch: (error) => error,
+          });
         }),
       ),
 
     "tool.execute.before": (input, output) =>
       runHook(
         "tool.execute.before",
-        Effect.try({
-          try: () =>
-            langfuse.traceToolStart({
-              sessionID: input.sessionID,
-              callID: input.callID,
+        Effect.gen(function* () {
+          yield* debugLog(
+            debug,
+            "tool.execute.before",
+            {
+              session_id: input.sessionID,
+              call_id: input.callID,
               tool: input.tool,
-              args: output.args,
-            }),
-          catch: (error) => error,
+            },
+            { argument_keys: Object.keys(asRecord(output.args) ?? {}) },
+          );
+          yield* Effect.try({
+            try: () =>
+              langfuse.traceToolStart({
+                sessionID: input.sessionID,
+                callID: input.callID,
+                tool: input.tool,
+                args: output.args,
+              }),
+            catch: (error) => error,
+          });
         }),
       ),
 
     "tool.execute.after": (input, output) =>
       runHook(
         "tool.execute.after",
-        Effect.try({
-          try: () =>
-            langfuse.traceToolEnd({
-              sessionID: input.sessionID,
-              callID: input.callID,
+        Effect.gen(function* () {
+          yield* debugLog(
+            debug,
+            "tool.execute.after",
+            {
+              session_id: input.sessionID,
+              call_id: input.callID,
               tool: input.tool,
-              args: input.args,
-              title: output.title,
-              output: output.output,
-            }),
-          catch: (error) => error,
+            },
+            {
+              title_length: output.title.length,
+              output_length: output.output.length,
+              metadata_keys: Object.keys(asRecord(output.metadata) ?? {}),
+            },
+          );
+          yield* Effect.try({
+            try: () =>
+              langfuse.traceToolEnd({
+                sessionID: input.sessionID,
+                callID: input.callID,
+                tool: input.tool,
+                args: input.args,
+                title: output.title,
+                output: output.output,
+              }),
+            catch: (error) => error,
+          });
         }),
       ),
   };
